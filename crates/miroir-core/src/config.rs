@@ -11,6 +11,8 @@ pub struct Config {
     pub name: String,
     /// Permanent token obtained from an invitation code.
     pub token: String,
+    /// Linux: lets the desktop reuse the last shared screen or window without asking again.
+    pub capture_restore_token: String,
 }
 
 /// Manual impl so the token never ends up in a log file.
@@ -19,6 +21,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("name", &self.name)
             .field("token", &"<redacted>")
+            .field("capture_restore_token", &self.capture_restore_token)
             .finish()
     }
 }
@@ -101,7 +104,11 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let path = temp_dir("roundtrip").join("not-created-yet").join("config.toml");
-        let config = Config { name: "Alexis".into(), token: "abc123".into() };
+        let config = Config {
+            name: "Alexis".into(),
+            token: "abc123".into(),
+            capture_restore_token: "restore-me".into(),
+        };
         config.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), config);
     }
@@ -147,7 +154,7 @@ mod tests {
     fn save_never_truncates_the_existing_file() {
         use std::io::Read;
         let path = temp_dir("atomic").join("config.toml");
-        let old = Config { name: "Alexis".into(), token: "abc123".into() };
+        let old = Config { name: "Alexis".into(), token: "abc123".into(), ..Default::default() };
         old.save_to(&path).unwrap();
         let mut reader = std::fs::File::open(&path).unwrap();
 
@@ -188,7 +195,7 @@ mod tests {
 
     #[test]
     fn debug_output_hides_token() {
-        let config = Config { name: "Alexis".into(), token: "abc123".into() };
+        let config = Config { name: "Alexis".into(), token: "abc123".into(), ..Default::default() };
         let debug = format!("{config:?}");
         assert!(debug.contains("Alexis") && !debug.contains("abc123"), "{debug}");
     }
