@@ -97,6 +97,17 @@ async fn portal() -> anyhow::Result<Screencast> {
     Screencast::with_connection(connection).await.context("screen capture portal unavailable")
 }
 
+/// A node read directly, without the portal: for diagnostics (see `docs/test-manuel.md`).
+impl VideoSource for PipewireStream {
+    fn next_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+        PipewireStream::next_frame(self, Duration::from_millis(100))
+    }
+
+    fn stop(&mut self) {
+        PipewireStream::stop(self);
+    }
+}
+
 impl VideoSource for PortalSource {
     fn next_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
         self.stream.next_frame(Duration::from_millis(100))

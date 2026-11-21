@@ -1,7 +1,8 @@
-mod fps;
 mod preview;
+mod stats;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use eframe::egui;
@@ -30,7 +31,20 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "Miroir",
         options,
-        Box::new(move |_| Ok(Box::new(App { config, config_path, preview: None, texture: None, message: None }))),
+        Box::new(move |creation| {
+            let mut app = App {
+                config,
+                config_path,
+                preview: None,
+                texture: None,
+                message: None,
+            };
+            // Diagnostics (docs/test-manuel.md): no picker to click through, start right away.
+            if std::env::var_os("MIROIR_PW_NODE").is_some() {
+                app.start_preview(&creation.egui_ctx, false);
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow!("cannot open the window: {e}"))
 }
@@ -114,19 +128,12 @@ impl eframe::App for App {
                     }
                 }
 
-                match (&self.preview, &self.texture) {
-                    (Some(preview), Some(texture)) => {
-                        let [width, height] = texture.size();
-                        let fps = preview.fps();
-                        // A screen where nothing moves sends no frames: 0 fps is expected then.
-                        let still = if fps == 0 { " (image fixe)" } else { "" };
-                        ui.label(format!("{fps} fps — {width}×{height}{still}"));
-                    }
-                    (Some(preview), None) if preview.is_open() => {
-                        ui.label("En attente de la première image…");
-                    }
-                    (Some(_), None) => {
+                match &self.preview {
+                    Some(preview) if !preview.is_open() => {
                         ui.label("Choisis la source dans la fenêtre du bureau…");
+                    }
+                    Some(_) if self.texture.is_none() => {
+                        ui.label("En attente de la première image…");
                     }
                     _ => {}
                 }
@@ -134,6 +141,9 @@ impl eframe::App for App {
                     ui.colored_label(ui.visuals().warn_fg_color, message);
                 }
             });
+            if let (Some(preview), Some(texture)) = (&self.preview, &self.texture) {
+                ui.label(status_line(preview, texture.size()));
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -143,5 +153,44 @@ impl eframe::App for App {
                 });
             }
         });
+    }
+}
+
+/// What is being shown and what each frame costs, over the last second.
+fn status_line(preview: &Preview, [width, height]: [usize; 2]) -> String {
+    let summary = preview.summary();
+    let mut line = format!("{} fps — {width}×{height}", summary.fps);
+    if let Some((name, hardware)) = preview.encoder() {
+        let kind = if hardware { "matériel" } else { "logiciel" };
+        line += &format!(" — {name} ({kind})");
+    }
+    if summary.fps == 0 {
+        // A screen where nothing moves sends no frames: 0 fps is expected then.
+        return line + " — image fixe";
+    }
+    line + &format!(
+        " — encodage {} + décodage {} = {} ms (pire image : {} ms) — affichage {} ms",
+        ms(summary.encode),
+        ms(summary.decode),
+        ms(summary.encode + summary.decode),
+        ms(summary.worst),
+        ms(summary.display),
+    )
+}
+
+/// Milliseconds with one decimal, written the French way: `9,1`.
+fn ms(duration: Duration) -> String {
+    format!("{:.1}", duration.as_secs_f64() * 1000.0).replace('.', ",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn milliseconds_use_a_decimal_comma() {
+        assert_eq!(ms(Duration::from_micros(9_149)), "9,1");
+        assert_eq!(ms(Duration::ZERO), "0,0");
+        assert_eq!(ms(Duration::from_millis(12)), "12,0");
     }
 }

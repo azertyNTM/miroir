@@ -7,5 +7,6 @@ edition.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 miroir-capture.workspace = true
+miroir-codec.workspace = true
 miroir-core.workspace = true
 tracing.workspace = true

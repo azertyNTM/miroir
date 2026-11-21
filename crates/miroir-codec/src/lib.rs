@@ -1,13 +1,282 @@
 //! Video encoding and decoding through FFmpeg, with automatic encoder selection.
 
+mod convert;
+mod decoder;
+mod encoder;
+
+pub use decoder::{DecodedFrame, Decoder, RgbaFrame};
+pub use encoder::{EncodedFrame, Encoder};
+
+/// Loads FFmpeg and keeps its own messages down to warnings: it writes them straight to stderr.
+fn init() -> anyhow::Result<()> {
+    ffmpeg_next::init()?;
+    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Warning);
+    Ok(())
+}
+
+/// Parts each picture is cut into by the encoders that can, and threads the decoder uses for
+/// them. Measured in 1080p at 10 Mbit/s on a Ryzen 5 2600X: decoding takes 4.5 ms with 1,
+/// 3.3 ms with 4, 2.5 ms with 8.
+const SLICES: usize = 8;
+
+/// Size a source is encoded at: it fits in 1920x1080 with the same proportions, is never
+/// enlarged, and has even sides (H.264 4:2:0 stores one colour sample per 2x2 pixels).
+pub fn encoded_size(width: u32, height: u32) -> (u32, u32) {
+    const MAX: (u64, u64) = (1920, 1080);
+    let (w, h) = (width as u64, height as u64);
+    let (w, h) = if w <= MAX.0 && h <= MAX.1 {
+        (w, h)
+    } else if w * MAX.1 > h * MAX.0 {
+        (MAX.0, h * MAX.0 / w)
+    } else {
+        (w * MAX.1 / h, MAX.1)
+    };
+    let even = |side: u64| (side as u32 & !1).max(2);
+    (even(w), even(h))
+}
+
 #[cfg(test)]
 mod tests {
-    use ffmpeg_next as ffmpeg;
+    use miroir_core::frame::{FrameData, VideoFrame};
 
-    /// Proves the FFmpeg libraries are found at build time and loaded at run time.
+    use super::*;
+
     #[test]
-    fn ffmpeg_links_and_has_h264_decoder() {
-        ffmpeg::init().unwrap();
-        assert!(ffmpeg::decoder::find(ffmpeg::codec::Id::H264).is_some());
+    fn encoded_size_follows_the_spec() {
+        assert_eq!(encoded_size(1920, 1080), (1920, 1080));
+        assert_eq!(
+            encoded_size(1280, 720),
+            (1280, 720),
+            "smaller sources are not enlarged"
+        );
+        assert_eq!(encoded_size(2560, 1440), (1920, 1080));
+        assert_eq!(encoded_size(3840, 2160), (1920, 1080));
+        assert_eq!(
+            encoded_size(3440, 1440),
+            (1920, 802),
+            "ultrawide: full width, even height"
+        );
+        assert_eq!(
+            encoded_size(1080, 1920),
+            (606, 1080),
+            "portrait: full height"
+        );
+        assert_eq!(
+            encoded_size(641, 479),
+            (640, 478),
+            "odd sides are rounded down"
+        );
+        assert_eq!(encoded_size(1, 1), (2, 2));
+        assert_eq!(encoded_size(8192, 1), (1920, 2));
+    }
+
+    /// Left half red, right half blue.
+    fn bars(width: u32, height: u32, pts_us: u64) -> VideoFrame {
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..height {
+            for x in 0..width {
+                bgra.extend(if x < width / 2 {
+                    [0, 0, 255, 255]
+                } else {
+                    [255, 0, 0, 255]
+                });
+            }
+        }
+        VideoFrame {
+            width,
+            height,
+            pts_us,
+            data: FrameData::CpuBgra(bgra),
+        }
+    }
+
+    fn pixel(frame: &RgbaFrame, x: u32, y: u32) -> [u8; 4] {
+        let row = frame.rows().nth(y as usize).unwrap();
+        row[x as usize * 4..][..4].try_into().unwrap()
+    }
+
+    fn assert_red_then_blue(frame: &RgbaFrame) {
+        let (quarter, middle) = (frame.width / 4, frame.height / 2);
+        let [r, g, b, a] = pixel(frame, quarter, middle);
+        assert!(
+            r > 200 && g < 60 && b < 60 && a == 255,
+            "left should be red: {r},{g},{b},{a}"
+        );
+        let [r, g, b, a] = pixel(frame, 3 * quarter, middle);
+        assert!(
+            r < 60 && g < 60 && b > 200 && a == 255,
+            "right should be blue: {r},{g},{b},{a}"
+        );
+    }
+
+    /// Encodes then decodes `count` frames, checking that nothing is held back: a frame that
+    /// goes in comes out at once, on both sides. That is what "low latency" means here.
+    fn roundtrip(encoder: &mut Encoder, width: u32, height: u32, count: u64) -> Vec<RgbaFrame> {
+        let mut decoder = Decoder::new().unwrap();
+        (0..count)
+            .map(|i| {
+                let pts_us = i * 16_667;
+                let packet = encoder
+                    .encode(&bars(width, height, pts_us))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{}: frame {i} was held back", encoder.name()));
+                assert_eq!(packet.keyframe, i == 0, "{}: frame {i}", encoder.name());
+                assert_eq!(packet.pts_us, pts_us);
+                let decoded = decoder
+                    .decode(&packet)
+                    .unwrap()
+                    .expect("decoder held the frame back");
+                assert_eq!(decoded.pts_us, pts_us);
+                decoder.to_rgba(&decoded).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn automatic_choice_roundtrip() {
+        let mut encoder = Encoder::new(1280, 720, None).unwrap();
+        for frame in roundtrip(&mut encoder, 1280, 720, 5) {
+            assert_eq!((frame.width, frame.height), (1280, 720));
+            assert_eq!(frame.rows().count(), 720);
+            assert!(frame.rows().all(|row| row.len() == 1280 * 4));
+            assert_red_then_blue(&frame);
+        }
+    }
+
+    /// The fallback used on machines without a usable hardware encoder.
+    #[test]
+    fn software_roundtrip() {
+        let mut encoder = Encoder::software(640, 360).unwrap();
+        assert!(!encoder.is_hardware());
+        roundtrip(&mut encoder, 640, 360, 5)
+            .iter()
+            .for_each(assert_red_then_blue);
+    }
+
+    #[test]
+    fn odd_sized_source_is_encoded_at_an_even_size() {
+        let mut encoder = Encoder::software(641, 479).unwrap();
+        let frame = roundtrip(&mut encoder, 641, 479, 2).pop().unwrap();
+        assert_eq!((frame.width, frame.height), (640, 478));
+        assert_red_then_blue(&frame);
+    }
+
+    #[test]
+    fn large_source_is_reduced_to_1080p() {
+        let mut encoder = Encoder::new(2560, 1440, None).unwrap();
+        let frame = roundtrip(&mut encoder, 2560, 1440, 2).pop().unwrap();
+        assert_eq!((frame.width, frame.height), (1920, 1080));
+        assert_red_then_blue(&frame);
+    }
+
+    #[test]
+    fn decoder_follows_a_size_change() {
+        let mut decoder = Decoder::new().unwrap();
+        for (width, height) in [(640, 360), (320, 240)] {
+            let mut encoder = Encoder::software(width, height).unwrap();
+            let packet = encoder.encode(&bars(width, height, 0)).unwrap().unwrap();
+            let frame = decoder.decode(&packet).unwrap().unwrap();
+            assert_eq!((frame.width, frame.height), (width, height));
+            assert_red_then_blue(&decoder.to_rgba(&frame).unwrap());
+        }
+    }
+
+    #[test]
+    fn unknown_forced_encoder_is_an_error() {
+        let error = Encoder::new(640, 360, Some("h264_nope")).err().unwrap();
+        assert!(format!("{error:#}").contains("h264_nope"), "{error:#}");
+    }
+
+    #[test]
+    fn frame_that_does_not_match_the_encoder_is_rejected() {
+        let mut encoder = Encoder::software(640, 360).unwrap();
+        assert!(encoder.encode(&bars(320, 240, 0)).is_err(), "other size");
+        let mut short = bars(640, 360, 0);
+        let FrameData::CpuBgra(bgra) = &mut short.data;
+        bgra.truncate(100);
+        assert!(
+            encoder.encode(&short).is_err(),
+            "buffer shorter than its size says"
+        );
+        assert!(Encoder::new(0, 0, None).is_err(), "empty source");
+        assert!(
+            Encoder::new(1, 720, None).is_err(),
+            "no room for a colour sample"
+        );
+    }
+
+    #[test]
+    fn garbage_is_an_error_not_a_crash() {
+        let mut decoder = Decoder::new().unwrap();
+        let garbage = EncodedFrame {
+            data: vec![0xAB; 500],
+            pts_us: 0,
+            keyframe: true,
+        };
+        assert!(!matches!(decoder.decode(&garbage), Ok(Some(_))));
+        let empty = EncodedFrame {
+            data: Vec::new(),
+            pts_us: 0,
+            keyframe: false,
+        };
+        assert!(!matches!(decoder.decode(&empty), Ok(Some(_))));
+    }
+
+    /// The spec's target on the real hardware encoder: encoding plus decoding under 10 ms per
+    /// 1080p frame. Needs a GPU, so CI does not run it:
+    /// `cargo test --release -p miroir-codec -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a hardware encoder"]
+    fn hardware_1080p_timings() {
+        use std::time::{Duration, Instant};
+
+        let (width, height) = (1920, 1080);
+        let mut encoder = Encoder::new(width, height, None).unwrap();
+        assert!(encoder.is_hardware(), "picked {}", encoder.name());
+        let mut decoder = Decoder::new().unwrap();
+        // Stripes and gradients that move: a still picture costs the decoder almost nothing.
+        let picture = |i: u32| {
+            let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let stripe = if (x + y + i * 8) / 32 % 2 == 0 {
+                        220
+                    } else {
+                        40
+                    };
+                    bgra.extend([(x / 4 + i * 3) as u8, stripe, (y / 4) as u8, 255]);
+                }
+            }
+            bgra
+        };
+        let pictures: Vec<Vec<u8>> = (0..30).map(picture).collect();
+
+        let (mut encode, mut decode, mut display) =
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let count = 300;
+        for i in 0..count {
+            let data = FrameData::CpuBgra(pictures[i as usize % pictures.len()].clone());
+            let frame = VideoFrame {
+                width,
+                height,
+                pts_us: i as u64 * 16_667,
+                data,
+            };
+            let start = Instant::now();
+            let packet = encoder.encode(&frame).unwrap().unwrap();
+            let encoded = Instant::now();
+            let decoded = decoder.decode(&packet).unwrap().unwrap();
+            let decoded_at = Instant::now();
+            decoder.to_rgba(&decoded).unwrap();
+            encode += encoded - start;
+            decode += decoded_at - encoded;
+            display += decoded_at.elapsed();
+        }
+        let (encode, decode, display) = (encode / count, decode / count, display / count);
+        println!(
+            "{}: encode {encode:?}, decode {decode:?}, to RGBA {display:?}",
+            encoder.name()
+        );
+        assert!(encode + decode < Duration::from_millis(10));
     }
 }

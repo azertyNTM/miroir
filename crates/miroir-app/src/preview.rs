@@ -1,16 +1,17 @@
-//! Local preview: a worker thread pulls frames from the capture and hands the UI the latest one.
+//! Local loop: a worker thread captures, encodes, decodes, and hands the UI the latest picture.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use eframe::egui;
 use miroir_capture::{SelectionCancelled, VideoSource};
-use miroir_core::frame::{FrameData, VideoFrame};
-use tracing::{info, warn};
+use miroir_codec::{Decoder, Encoder};
+use tracing::{debug, info, warn};
 
-use crate::fps::FpsCounter;
+use crate::stats::{Stats, Summary, Timing};
 
 pub enum Event {
     /// Token that lets the desktop reuse the user's choice next time.
@@ -20,10 +21,14 @@ pub enum Event {
     Ended(Option<String>),
 }
 
+/// The encoder in use: FFmpeg's name for it, and whether the GPU does the work.
+pub type EncoderInfo = (&'static str, bool);
+
 #[derive(Default)]
 struct Shared {
     image: Mutex<Option<egui::ColorImage>>,
-    fps: AtomicU32,
+    summary: Mutex<Summary>,
+    encoder: Mutex<Option<EncoderInfo>>,
     /// The source is open: the user has answered the desktop's picker.
     open: AtomicBool,
     stop: AtomicBool,
@@ -60,13 +65,18 @@ impl Preview {
         Self { shared, events }
     }
 
-    /// The latest frame, if a new one arrived since the last call.
+    /// The latest decoded picture, if a new one arrived since the last call.
     pub fn take_image(&self) -> Option<egui::ColorImage> {
         self.shared.image.lock().unwrap().take()
     }
 
-    pub fn fps(&self) -> u32 {
-        self.shared.fps.load(Relaxed)
+    pub fn summary(&self) -> Summary {
+        *self.shared.summary.lock().unwrap()
+    }
+
+    /// `None` until the first frame is encoded.
+    pub fn encoder(&self) -> Option<EncoderInfo> {
+        *self.shared.encoder.lock().unwrap()
     }
 
     /// False while the desktop's picker is still waiting for the user.
@@ -95,17 +105,54 @@ fn run(
     shared.open.store(true, Relaxed);
     // Also lets the UI save the restore token even if the source sends no frame yet.
     ctx.request_repaint();
-    let mut fps = FpsCounter::default();
+
+    // For tests and diagnostics, e.g. MIROIR_ENCODER=libx264 to try the software fallback.
+    let forced = std::env::var("MIROIR_ENCODER").ok();
+    let mut encoder: Option<Encoder> = None;
+    let mut decoder = Decoder::new()?;
+    let mut stats = Stats::default();
+    let mut logged = Instant::now();
     while !shared.stop.load(Relaxed) {
-        let frame = source.next_frame()?;
-        let now = Instant::now();
-        if let Some(frame) = frame {
-            fps.tick(now);
-            *shared.image.lock().unwrap() = Some(to_color_image(&frame));
-            ctx.request_repaint();
+        if let Some(frame) = source.next_frame()? {
+            // ponytail: a new encoder for every new size, so one per frame while a captured
+            // window is being resized. Wait for the size to settle if that ever stutters.
+            let size = (frame.width, frame.height);
+            let encoder = match &mut encoder {
+                Some(encoder) if encoder.source_size() == size => encoder,
+                slot => {
+                    let new = Encoder::new(size.0, size.1, forced.as_deref())?;
+                    *shared.encoder.lock().unwrap() = Some((new.name(), new.is_hardware()));
+                    slot.insert(new)
+                }
+            };
+
+            let start = Instant::now();
+            let packet = encoder.encode(&frame)?;
+            let encoded = Instant::now();
+            let decoded = match &packet {
+                Some(packet) => decoder.decode(packet)?,
+                None => None,
+            };
+            let decoded_at = Instant::now();
+            if let Some(decoded) = decoded {
+                let rgba = decoder.to_rgba(&decoded)?;
+                let size = [rgba.width as usize, rgba.height as usize];
+                *shared.image.lock().unwrap() = Some(to_color_image(size, rgba.rows()));
+                let now = Instant::now();
+                let timing = Timing {
+                    encode: encoded - start,
+                    decode: decoded_at - encoded,
+                    display: now - decoded_at,
+                };
+                stats.record(now, timing);
+            }
         }
-        let current = fps.fps(now);
-        if shared.fps.swap(current, Relaxed) != current {
+        let summary = stats.summary(Instant::now());
+        if summary.fps > 0 && logged.elapsed() >= Duration::from_secs(1) {
+            debug!(?summary, "last second");
+            logged = Instant::now();
+        }
+        if std::mem::replace(&mut *shared.summary.lock().unwrap(), summary) != summary {
             ctx.request_repaint();
         }
     }
@@ -118,6 +165,15 @@ fn open_source(
     restore_token: Option<&str>,
     events: &Sender<Event>,
 ) -> anyhow::Result<Box<dyn VideoSource>> {
+    // Diagnostics: read a PipeWire node directly, without the desktop's picker.
+    if let Ok(node) = std::env::var("MIROIR_PW_NODE") {
+        let node = node
+            .parse()
+            .context("MIROIR_PW_NODE must be a PipeWire node id")?;
+        return Ok(Box::new(miroir_capture::linux::PipewireStream::connect(
+            None, node,
+        )?));
+    }
     let (source, new_token) = miroir_capture::linux::PortalSource::open(restore_token)?;
     if let Some(token) = new_token {
         let _ = events.send(Event::RestoreToken(token));
@@ -133,12 +189,16 @@ fn open_source(
     anyhow::bail!("screen capture is not available on this system yet")
 }
 
-// ponytail: CPU channel swap plus an egui texture upload per frame, fine for a preview.
-// The real viewer draws decoded NV12 with a wgpu shader (phase 2 and later).
-pub fn to_color_image(frame: &VideoFrame) -> egui::ColorImage {
-    let FrameData::CpuBgra(bgra) = &frame.data;
-    let pixels = bgra.chunks_exact(4).map(|p| egui::Color32::from_rgb(p[2], p[1], p[0])).collect();
-    egui::ColorImage::new([frame.width as usize, frame.height as usize], pixels)
+/// `rows`: `size[1]` rows of `size[0]` pixels, 4 bytes each: R, G, B and an alpha of 255.
+// ponytail: one more copy of the picture, then an egui texture upload, per frame. Both go away
+// when the viewer draws the decoder's YUV with its own shader (phase 9).
+fn to_color_image<'a>(size: [usize; 2], rows: impl Iterator<Item = &'a [u8]>) -> egui::ColorImage {
+    let mut pixels = Vec::with_capacity(size[0] * size[1]);
+    for row in rows {
+        let row = row.chunks_exact(4);
+        pixels.extend(row.map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3])));
+    }
+    egui::ColorImage::new(size, pixels)
 }
 
 #[cfg(test)]
@@ -146,16 +206,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bgra_becomes_opaque_rgb() {
-        let frame = VideoFrame {
-            width: 2,
-            height: 1,
-            pts_us: 0,
-            // Blue then red; the alpha byte of a captured frame is not meaningful.
-            data: FrameData::CpuBgra(vec![255, 0, 0, 0, 0, 0, 255, 7]),
-        };
-        let image = to_color_image(&frame);
-        assert_eq!(image.size, [2, 1]);
-        assert_eq!(image.pixels, [egui::Color32::BLUE, egui::Color32::RED]);
+    fn rgba_rows_become_an_image() {
+        let rows: [&[u8]; 2] = [
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            &[0, 255, 0, 255, 0, 0, 0, 255],
+        ];
+        let image = to_color_image([2, 2], rows.into_iter());
+        assert_eq!(image.size, [2, 2]);
+        let expected = [
+            egui::Color32::RED,
+            egui::Color32::BLUE,
+            egui::Color32::GREEN,
+            egui::Color32::BLACK,
+        ];
+        assert_eq!(image.pixels, expected);
     }
 }
