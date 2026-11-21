@@ -4,13 +4,23 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Display name shown to the other peer.
     pub name: String,
     /// Permanent token obtained from an invitation code.
     pub token: String,
+}
+
+/// Manual impl so the token never ends up in a log file.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("name", &self.name)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,7 +54,19 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(std::fs::write(path, toml::to_string_pretty(self)?)?)
+        let text = toml::to_string_pretty(self)?;
+
+        // The file holds the token: owner-only on Unix. On Windows, %APPDATA% is already
+        // restricted to the user by its ACL.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(path)?;
+        // `mode` only applies to a file created by this call: tighten an existing one too.
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        Ok(std::io::Write::write_all(&mut file, text.as_bytes())?)
     }
 }
 
@@ -89,6 +111,38 @@ mod tests {
         std::fs::write(&path, "name = [").unwrap();
         assert!(matches!(Config::load_from(&path), Err(ConfigError::Parse(_))));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "name = [");
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_file_is_readable_by_owner_only() {
+        let path = temp_dir("private-new").join("config.toml");
+        Config::default().save_to(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_world_readable_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_dir("private-existing").join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Config::default().save_to(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn debug_output_hides_token() {
+        let config = Config { name: "Alexis".into(), token: "abc123".into() };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("Alexis") && !debug.contains("abc123"), "{debug}");
     }
 
     #[test]

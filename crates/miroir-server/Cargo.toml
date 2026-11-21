@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+miroir-core.workspace = true
+tracing.workspace = true
