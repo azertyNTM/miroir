@@ -27,8 +27,10 @@ impl std::fmt::Debug for Config {
 pub enum ConfigError {
     #[error("cannot access the config file: {0}")]
     Io(#[from] std::io::Error),
+    /// Line number and message only: the `toml` error itself quotes the file in its Display
+    /// and Debug output, which would put the token in the logs.
     #[error("the config file is not valid TOML: {0}")]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("cannot serialize the config: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
@@ -43,7 +45,11 @@ impl Config {
     /// A missing file is not an error: it yields the default config.
     pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => toml::from_str(&text).map_err(|e| {
+                let before = e.span().map_or(0, |span| span.start.min(text.len()));
+                let line = text.as_bytes()[..before].iter().filter(|b| **b == b'\n').count() + 1;
+                ConfigError::Parse(format!("line {line}: {}", e.message()))
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
         }
@@ -56,17 +62,21 @@ impl Config {
         }
         let text = toml::to_string_pretty(self)?;
 
+        // Written aside then renamed over the target: a crash in the middle of a save must not
+        // leave a truncated file, which would load as an empty config and lose the token.
+        let tmp = path.with_extension("toml.tmp");
+        let _ = std::fs::remove_file(&tmp); // left over from an interrupted save
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         // The file holds the token: owner-only on Unix. On Windows, %APPDATA% is already
         // restricted to the user by its ACL.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(path)?;
-        // `mode` only applies to a file created by this call: tighten an existing one too.
-        #[cfg(unix)]
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        Ok(std::io::Write::write_all(&mut file, text.as_bytes())?)
+        let mut file = options.open(&tmp)?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        Ok(std::fs::rename(&tmp, path)?)
     }
 }
 
@@ -111,6 +121,44 @@ mod tests {
         std::fs::write(&path, "name = [").unwrap();
         assert!(matches!(Config::load_from(&path), Err(ConfigError::Parse(_))));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "name = [");
+    }
+
+    #[test]
+    fn unreadable_file_is_an_error() {
+        // A directory where the file should be: reading fails with something else than NotFound.
+        let path = temp_dir("unreadable");
+        assert!(matches!(Config::load_from(&path), Err(ConfigError::Io(_))));
+    }
+
+    #[test]
+    fn parse_error_does_not_leak_the_file_content() {
+        let path = temp_dir("leak").join("config.toml");
+        std::fs::write(&path, "name = \"Alexis\"\ntoken = \"SECRET-abc123\n").unwrap();
+        let error = Config::load_from(&path).unwrap_err();
+        let printed = format!("{error} {error:?}");
+        assert!(!printed.contains("SECRET"), "{printed}");
+        assert!(printed.contains("line 2"), "{printed}");
+    }
+
+    /// A reader that opened the old file keeps seeing the old content: the new one is written
+    /// aside and renamed over it, so a crash in the middle of a save cannot leave an empty config.
+    #[cfg(unix)]
+    #[test]
+    fn save_never_truncates_the_existing_file() {
+        use std::io::Read;
+        let path = temp_dir("atomic").join("config.toml");
+        let old = Config { name: "Alexis".into(), token: "abc123".into() };
+        old.save_to(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+
+        Config::default().save_to(&path).unwrap();
+
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), old);
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "temporary file left behind");
     }
 
     #[cfg(unix)]

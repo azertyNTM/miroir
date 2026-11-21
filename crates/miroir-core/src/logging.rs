@@ -13,10 +13,11 @@ pub fn init_logging() {
 
 fn filter_from(value: Option<&str>) -> EnvFilter {
     // `info` stays the base level: EnvFilter reads an unknown word such as `debgu` as a
-    // module name, which on its own would silence every log.
-    value
-        .and_then(|v| EnvFilter::try_new(format!("info,{v}")).ok())
-        .unwrap_or_else(|| EnvFilter::new("info"))
+    // module name, which on its own would silence every log. Lossy parsing keeps the valid
+    // directives and reports the invalid ones on stderr. Whitespace is dropped because
+    // `set MIROIR_LOG=debug && app.exe` in cmd.exe leaves a trailing space in the value.
+    let directives: String = value.unwrap_or("").split_whitespace().collect();
+    EnvFilter::builder().parse_lossy(format!("info,{directives}"))
 }
 
 #[cfg(test)]
@@ -66,6 +67,21 @@ mod tests {
     #[test]
     fn warn_hides_info() {
         assert_eq!(logged(Some("warn")), "");
+    }
+
+    /// `set MIROIR_LOG=debug && miroir-app.exe` in cmd.exe keeps the space before `&&`.
+    #[test]
+    fn whitespace_is_ignored() {
+        for value in [" debug ", "debug , miroir_net=trace"] {
+            let out = logged(Some(value));
+            assert!(out.contains("info-line") && out.contains("debug-line"), "{value:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn one_bad_directive_keeps_the_valid_ones() {
+        let out = logged(Some("debug,miroir_net=trcae"));
+        assert!(out.contains("info-line") && out.contains("debug-line"), "{out}");
     }
 
     #[test]

@@ -10,4 +10,12 @@ Read `PLAN.md` first: it is the spec (architecture, technical choices, phases, v
 
 ## Progress
 
-- Phase 0 (foundations): in progress.
+- Phase 0 (foundations): done — workspace, config, logging, CI green on Linux and Windows (FFmpeg links on both).
+- Next: phase 1 (Linux capture with local preview), once Alexis has validated phase 0.
+
+## Notes for later phases
+
+- GitHub repo: `azertyNTM/miroir` (public). Commits use the GitHub noreply address set in the repo-local git config.
+- Windows CI uses the BtbN LGPL shared FFmpeg build: no `libx264` there, the software fallback on Windows is `libopenh264`.
+- Linux CI (Ubuntu) builds against an older FFmpeg than Arch and the Windows CI (9.0): if CI is red but local is green in phase 2, run the Linux job in an `archlinux` container.
+- Logs still contain ANSI colour codes when redirected to a file: disable them when file logging lands (phase 3).
