@@ -8,3 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 miroir-core = { path = "crates/miroir-core" }
+directories = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+toml = "1.2"
