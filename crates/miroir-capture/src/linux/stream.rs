@@ -41,6 +41,21 @@ impl Shared {
         self.state.lock().unwrap().ended.get_or_insert_with(|| reason.into());
         self.wake.notify_one();
     }
+
+    /// Waits at most `timeout`. A frame still pending is delivered before the end is reported.
+    fn take(&self, timeout: Duration) -> anyhow::Result<Option<VideoFrame>> {
+        let mut state = self.state.lock().unwrap();
+        if state.frame.is_none() && state.ended.is_none() {
+            state = self.wake.wait_timeout(state, timeout).unwrap().0;
+        }
+        if let Some(frame) = state.frame.take() {
+            return Ok(Some(frame));
+        }
+        match &state.ended {
+            Some(reason) => Err(anyhow!("{reason}")),
+            None => Ok(None),
+        }
+    }
 }
 
 struct Quit;
@@ -69,17 +84,7 @@ impl PipewireStream {
 
     /// Waits at most `timeout` for a frame. `Ok(None)`: nothing new. `Err`: the stream is over.
     pub fn next_frame(&self, timeout: Duration) -> anyhow::Result<Option<VideoFrame>> {
-        let mut state = self.shared.state.lock().unwrap();
-        if state.frame.is_none() && state.ended.is_none() {
-            state = self.shared.wake.wait_timeout(state, timeout).unwrap().0;
-        }
-        if let Some(frame) = state.frame.take() {
-            return Ok(Some(frame));
-        }
-        match &state.ended {
-            Some(reason) => Err(anyhow!("{reason}")),
-            None => Ok(None),
-        }
+        self.shared.take(timeout)
     }
 
     /// Lets another thread end the stream with a reason. Needed because PipeWire itself only
@@ -188,18 +193,29 @@ fn run(
             move |stream, format| {
                 let Some(mut buffer) = stream.dequeue_buffer() else { return };
                 let Some(data) = buffer.datas_mut().first_mut() else { return };
+                // Every skipped buffer is logged: otherwise a source we cannot read looks exactly
+                // like a screen where nothing moves.
                 let order = match format.format() {
                     VideoFormat::BGRx | VideoFormat::BGRA => ChannelOrder::Bgr,
                     VideoFormat::RGBx | VideoFormat::RGBA => ChannelOrder::Rgb,
-                    _ => return,
+                    other => return debug!(?other, "skipped buffer: unexpected pixel format"),
                 };
+                let (width, height) = (format.size().width, format.size().height);
                 let chunk = data.chunk();
                 let (offset, size) = (chunk.offset() as usize, chunk.size() as usize);
-                let stride = chunk.stride().max(0) as usize;
-                let Some(bytes) = data.data() else { return };
-                let Some(bytes) = bytes.get(offset..offset.saturating_add(size)) else { return };
+                // Some producers leave the stride at 0: assume rows without padding.
+                let stride = match chunk.stride() {
+                    stride if stride > 0 => stride as usize,
+                    _ => width as usize * 4,
+                };
+                let kind = data.type_();
+                let Some(bytes) = data.data() else {
+                    return debug!(?kind, "skipped buffer: not mapped in memory");
+                };
+                let Some(bytes) = bytes.get(offset..offset.saturating_add(size)) else {
+                    return debug!(offset, size, "skipped buffer: chunk outside the mapping");
+                };
 
-                let (width, height) = (format.size().width, format.size().height);
                 match pack_bgra(bytes, stride, width, height, order) {
                     Some(bgra) => shared.push(VideoFrame {
                         width,
@@ -259,7 +275,8 @@ fn format_request() -> spa::pod::Object {
             Rectangle { width: 1, height: 1 },
             Rectangle { width: 8192, height: 8192 }
         ),
-        // 0/1 means "variable": frames come when the screen changes.
+        // Any rate, including 0/1 ("variable": frames come when the screen changes), which is
+        // what compositors announce. The cap is the max framerate below.
         property!(
             FormatProperties::VideoFramerate,
             Choice,
@@ -267,7 +284,7 @@ fn format_request() -> spa::pod::Object {
             Fraction,
             Fraction { num: MAX_FPS, denom: 1 },
             Fraction { num: 0, denom: 1 },
-            Fraction { num: MAX_FPS, denom: 1 }
+            Fraction { num: 1000, denom: 1 }
         ),
         property!(
             FormatProperties::VideoMaxFramerate,
@@ -288,4 +305,52 @@ fn serialize_pod(object: spa::pod::Object) -> anyhow::Result<Vec<u8>> {
     )
     .map_err(|e| anyhow!("cannot serialize the format request: {e:?}"))?;
     Ok(cursor.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NO_WAIT: Duration = Duration::ZERO;
+
+    fn frame(pts_us: u64) -> VideoFrame {
+        VideoFrame { width: 1, height: 1, pts_us, data: FrameData::CpuBgra(vec![0; 4]) }
+    }
+
+    #[test]
+    fn slot_keeps_only_the_latest_frame() {
+        let shared = Shared::default();
+        shared.push(frame(1));
+        shared.push(frame(2));
+        assert_eq!(shared.take(NO_WAIT).unwrap().unwrap().pts_us, 2);
+        assert!(shared.take(NO_WAIT).unwrap().is_none(), "a frame is delivered once");
+    }
+
+    #[test]
+    fn pending_frame_is_delivered_before_the_end() {
+        let shared = Shared::default();
+        shared.push(frame(1));
+        shared.end("first reason");
+        shared.end("a consequence of the first");
+        assert_eq!(shared.take(NO_WAIT).unwrap().unwrap().pts_us, 1);
+        assert_eq!(shared.take(NO_WAIT).err().unwrap().to_string(), "first reason");
+    }
+
+    #[test]
+    fn take_wakes_up_when_a_frame_arrives() {
+        let shared = Arc::new(Shared::default());
+        let producer = std::thread::spawn({
+            let shared = shared.clone();
+            move || shared.push(frame(7))
+        });
+        // Far longer than the test should take: it only elapses if the wake-up is broken.
+        assert_eq!(shared.take(Duration::from_secs(10)).unwrap().unwrap().pts_us, 7);
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn format_request_is_a_valid_pod() {
+        let bytes = serialize_pod(format_request()).unwrap();
+        assert!(spa::pod::Pod::from_bytes(&bytes).is_some());
+    }
 }

@@ -30,14 +30,10 @@ impl PortalSource {
     ///
     /// Blocks until the user has answered: call it off the UI thread.
     pub fn open(restore_token: Option<&str>) -> anyhow::Result<(Self, Option<String>)> {
-        // zbus needs a running executor for as long as the session lives.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()?;
+        let runtime = new_runtime()?;
 
         let (session, remote, node_id, new_token) = runtime.block_on(async {
-            let proxy = Screencast::new().await.context("screen capture portal unavailable")?;
+            let proxy = portal().await?;
             let session = proxy.create_session(Default::default()).await?;
             proxy
                 .select_sources(
@@ -49,7 +45,9 @@ impl PortalSource {
                         .set_persist_mode(PersistMode::ExplicitlyRevoked)
                         .set_restore_token(restore_token),
                 )
-                .await?;
+                .await?
+                .response()
+                .context("the portal refused the capture options")?;
             let streams = match proxy.start(&session, None, Default::default()).await?.response() {
                 Ok(streams) => streams,
                 Err(ashpd::Error::Response(ResponseError::Cancelled)) => {
@@ -87,6 +85,18 @@ impl PortalSource {
     }
 }
 
+/// zbus needs a running executor for as long as the session lives.
+fn new_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()
+}
+
+/// A connection of our own, not ashpd's process-wide one: that one stays bound to the runtime
+/// that first used it and never answers again once that runtime is dropped.
+async fn portal() -> anyhow::Result<Screencast> {
+    let connection = ashpd::zbus::Connection::session().await.context("no D-Bus session")?;
+    Screencast::with_connection(connection).await.context("screen capture portal unavailable")
+}
+
 impl VideoSource for PortalSource {
     fn next_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
         self.stream.next_frame(Duration::from_millis(100))
@@ -105,5 +115,27 @@ impl VideoSource for PortalSource {
 impl Drop for PortalSource {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each capture owns its runtime: the portal must still answer after earlier runtimes are
+    /// gone. Needs a desktop session: `cargo test -p miroir-capture -- --ignored`.
+    #[test]
+    #[ignore = "needs a running desktop portal"]
+    fn portal_answers_from_successive_runtimes() {
+        for round in 1..=3 {
+            let runtime = new_runtime().unwrap();
+            let answer = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    anyhow::Ok(portal().await?.available_source_types().await?)
+                })
+                .await
+            });
+            assert!(matches!(answer, Ok(Ok(_))), "round {round}: {answer:?}");
+        }
     }
 }

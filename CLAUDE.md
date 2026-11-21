@@ -18,6 +18,8 @@ Read `PLAN.md` first: it is the spec (architecture, technical choices, phases, v
 
 - The PipeWire consumer can be exercised without the portal: `docs/test-manuel.md` explains how to publish a GStreamer test pattern and read it with the `pw_node` example.
 - PipeWire does not report an error when the captured node disappears (the stream just pauses): the end of a capture comes from the portal session's `Closed` signal.
+- Each `PortalSource` owns its tokio runtime and its own D-Bus connection. Never use `Screencast::new()` (ashpd's process-wide connection): it stops answering once the first runtime is dropped. `cargo test -p miroir-capture -- --ignored` checks this against the real portal.
+- `PortalSource::stop` (and so its `Drop`) calls `block_on`: it panics if called from inside a tokio task. Keep sources on plain threads, or rework this when the app gets a shared runtime (phase 5).
 - `VideoSource::next_frame` waits up to 100 ms and returns `Ok(None)` when nothing changed on screen: phase 2 must resend the last frame itself (PLAN.md chapter 6, "image fixe").
 
 - GitHub repo: `azertyNTM/miroir` (public). Commits use the GitHub noreply address set in the repo-local git config.

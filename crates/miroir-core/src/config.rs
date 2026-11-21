@@ -15,13 +15,15 @@ pub struct Config {
     pub capture_restore_token: String,
 }
 
-/// Manual impl so the token never ends up in a log file.
+/// Manual impl so the tokens never end up in a log file: logs are meant to be sent to someone
+/// else. It only tells whether each one is set.
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let presence = |secret: &str| if secret.is_empty() { "<empty>" } else { "<set>" };
         f.debug_struct("Config")
             .field("name", &self.name)
-            .field("token", &"<redacted>")
-            .field("capture_restore_token", &self.capture_restore_token)
+            .field("token", &presence(&self.token))
+            .field("capture_restore_token", &presence(&self.capture_restore_token))
             .finish()
     }
 }
@@ -195,9 +197,17 @@ mod tests {
 
     #[test]
     fn debug_output_hides_token() {
-        let config = Config { name: "Alexis".into(), token: "abc123".into(), ..Default::default() };
+        let config = Config {
+            name: "Alexis".into(),
+            token: "abc123".into(),
+            capture_restore_token: "restore-me".into(),
+        };
         let debug = format!("{config:?}");
-        assert!(debug.contains("Alexis") && !debug.contains("abc123"), "{debug}");
+        assert!(debug.contains("Alexis"), "{debug}");
+        assert!(!debug.contains("abc123") && !debug.contains("restore-me"), "{debug}");
+        // Still tells whether each one is there: the question a log has to answer.
+        assert_eq!(debug.matches("<set>").count(), 2, "{debug}");
+        assert_eq!(format!("{:?}", Config::default()).matches("<empty>").count(), 2);
     }
 
     #[test]

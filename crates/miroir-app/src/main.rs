@@ -45,9 +45,9 @@ struct App {
 }
 
 impl App {
-    fn start_preview(&mut self, ctx: &egui::Context) {
-        let token = &self.config.capture_restore_token;
-        let token = (!token.is_empty()).then(|| token.clone());
+    /// `reuse_last_source`: ask the desktop for the source picked last time, without its picker.
+    fn start_preview(&mut self, ctx: &egui::Context, reuse_last_source: bool) {
+        let token = reuse_last_source.then(|| self.config.capture_restore_token.clone());
         self.message = None;
         self.preview = Some(Preview::start(ctx.clone(), token));
     }
@@ -95,12 +95,23 @@ impl eframe::App for App {
 
         egui::Panel::top("controls").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if self.preview.is_some() {
-                    if ui.button("Arrêter").clicked() {
+                if let Some(preview) = &self.preview {
+                    // Not while the desktop's picker is open: it cannot be closed from here.
+                    let stop = ui.add_enabled(preview.is_open(), egui::Button::new("Arrêter"));
+                    if stop.clicked() {
                         self.stop_preview();
                     }
-                } else if ui.button("Choisir un écran ou une fenêtre").clicked() {
-                    self.start_preview(ui.ctx());
+                } else if self.config.capture_restore_token.is_empty() {
+                    if ui.button("Choisir un écran ou une fenêtre").clicked() {
+                        self.start_preview(ui.ctx(), false);
+                    }
+                } else {
+                    if ui.button("Reprendre la dernière source").clicked() {
+                        self.start_preview(ui.ctx(), true);
+                    }
+                    if ui.button("Choisir une autre source…").clicked() {
+                        self.start_preview(ui.ctx(), false);
+                    }
                 }
 
                 match (&self.preview, &self.texture) {
@@ -111,8 +122,11 @@ impl eframe::App for App {
                         let still = if fps == 0 { " (image fixe)" } else { "" };
                         ui.label(format!("{fps} fps — {width}×{height}{still}"));
                     }
+                    (Some(preview), None) if preview.is_open() => {
+                        ui.label("En attente de la première image…");
+                    }
                     (Some(_), None) => {
-                        ui.label("En attente de la source…");
+                        ui.label("Choisis la source dans la fenêtre du bureau…");
                     }
                     _ => {}
                 }

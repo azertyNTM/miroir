@@ -14,6 +14,7 @@ use crate::fps::FpsCounter;
 
 pub enum Event {
     /// Token that lets the desktop reuse the user's choice next time.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     RestoreToken(String),
     /// The capture is over; the text is the reason when it was not asked for.
     Ended(Option<String>),
@@ -23,6 +24,8 @@ pub enum Event {
 struct Shared {
     image: Mutex<Option<egui::ColorImage>>,
     fps: AtomicU32,
+    /// The source is open: the user has answered the desktop's picker.
+    open: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -66,6 +69,11 @@ impl Preview {
         self.shared.fps.load(Relaxed)
     }
 
+    /// False while the desktop's picker is still waiting for the user.
+    pub fn is_open(&self) -> bool {
+        self.shared.open.load(Relaxed)
+    }
+
     pub fn poll_event(&self) -> Option<Event> {
         self.events.try_recv().ok()
     }
@@ -84,6 +92,9 @@ fn run(
     restore_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut source = open_source(restore_token, events)?;
+    shared.open.store(true, Relaxed);
+    // Also lets the UI save the restore token even if the source sends no frame yet.
+    ctx.request_repaint();
     let mut fps = FpsCounter::default();
     while !shared.stop.load(Relaxed) {
         let frame = source.next_frame()?;
