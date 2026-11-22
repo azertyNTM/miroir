@@ -94,7 +94,7 @@ impl Decoder {
         let from = (frame.picture.format(), width, height);
         let scaler = match &mut self.scaler {
             Some(scaler) if scaler.from() == from => scaler,
-            slot => slot.insert(Scaler::new(from, (Pixel::RGBA, width, height))?),
+            slot => slot.insert(Scaler::new(from, (Pixel::RGBA, width, height), false)?),
         };
         let mut picture = ffmpeg::frame::Video::new(Pixel::RGBA, width, height);
         scaler.run(&frame.picture, &mut picture)?;

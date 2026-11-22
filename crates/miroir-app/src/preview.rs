@@ -1,7 +1,8 @@
 //! Local loop: a worker thread captures, encodes, decodes, and hands the UI the latest picture.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,8 @@ struct Shared {
 pub struct Preview {
     shared: Arc<Shared>,
     events: Receiver<Event>,
+    /// `Ended` was handed out: there is nothing more to report.
+    ended: Cell<bool>,
 }
 
 impl Preview {
@@ -62,7 +65,11 @@ impl Preview {
                 ctx.request_repaint();
             }
         });
-        Self { shared, events }
+        Self {
+            shared,
+            events,
+            ended: Cell::new(false),
+        }
     }
 
     /// The latest decoded picture, if a new one arrived since the last call.
@@ -85,7 +92,19 @@ impl Preview {
     }
 
     pub fn poll_event(&self) -> Option<Event> {
-        self.events.try_recv().ok()
+        if self.ended.get() {
+            return None;
+        }
+        let event = match self.events.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => return None,
+            // The worker always sends `Ended` before it returns: without it, it panicked.
+            Err(TryRecvError::Disconnected) => {
+                Event::Ended(Some("erreur interne, voir le terminal".into()))
+            }
+        };
+        self.ended.set(matches!(event, Event::Ended(_)));
+        Some(event)
     }
 }
 
@@ -204,6 +223,39 @@ fn to_color_image<'a>(size: [usize; 2], rows: impl Iterator<Item = &'a [u8]>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The worker always says why it ends. A channel closed without that word means it
+    /// panicked: the UI must not keep showing a frozen picture as if all was well.
+    #[test]
+    fn a_worker_that_died_ends_the_capture() {
+        let (sender, events) = channel();
+        let preview = Preview {
+            shared: Arc::default(),
+            events,
+            ended: Cell::new(false),
+        };
+        assert!(
+            preview.poll_event().is_none(),
+            "still running: nothing to report"
+        );
+        drop(sender);
+        assert!(matches!(preview.poll_event(), Some(Event::Ended(Some(_)))));
+        assert!(preview.poll_event().is_none(), "reported once");
+    }
+
+    #[test]
+    fn a_normal_end_is_not_mistaken_for_a_crash() {
+        let (sender, events) = channel();
+        let preview = Preview {
+            shared: Arc::default(),
+            events,
+            ended: Cell::new(false),
+        };
+        sender.send(Event::Ended(None)).unwrap();
+        drop(sender);
+        assert!(matches!(preview.poll_event(), Some(Event::Ended(None))));
+        assert!(preview.poll_event().is_none());
+    }
 
     #[test]
     fn rgba_rows_become_an_image() {

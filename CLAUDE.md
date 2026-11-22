@@ -31,11 +31,15 @@ Read `PLAN.md` first: it is the spec (architecture, technical choices, phases, v
 
 ## Measurements behind phase 2 (Ryzen 5 2600X, RX 5500 XT, 1080p, 10 Mbit/s)
 
-- `h264_vaapi` takes 4.5 ms per frame in the GPU, whatever the options (the default preset is already the fastest). With the colour conversion (1 ms) and the upload (1.2 ms), encoding is about 7 ms. Decoding is 1 to 3.5 ms depending on the picture. The spec's 10 ms target leaves little room: measure before adding anything per frame.
+- `h264_vaapi` takes 4.5 ms per frame in the GPU, whatever the options (the default preset is already the fastest; CAVLC instead of CABAC only saves 0.3 ms of decoding). With the colour conversion (1 ms) and the upload (1.2 ms), encoding is about 7 ms. Decoding is 1 to 3.5 ms depending on the picture. Encoding plus decoding is therefore 8 to 10.5 ms: the spec's 10 ms target is at the limit of this hardware, and is not met on every frame. Measure before adding anything per frame.
 - Decoding is software on purpose: the GPU decodes in 1.5 ms but reading the picture back to CPU memory costs 3 ms more. Hardware decoding only pays once the picture stays on the GPU (phase 9). Phase 3 asks for D3D11VA: measure the read-back there before choosing.
 - The encoder cuts each picture into 8 slices so the decoder can use 8 threads (`SLICES`): 4.5 ms with one slice, 2.5 ms with 8.
 - swscale alone is too slow for 60 fps (4.6 ms for BGRA to NV12 in 1080p, 12 ms to reduce 1440p): `convert.rs` does BGRA to NV12 on several cores, and swscale only resizes afterwards, with threads.
 - The VAAPI rate control spends the whole 10 Mbit/s even on a still picture, in CBR and in VBR. To look at in phase 7.
 - Colours are BT.601 limited range on both sides and the stream does not say so: a shader or a hardware decoder added later must use the same matrix, or the encoder must start flagging it.
-- The picture is still converted to RGBA on the CPU for an egui texture (2 ms per frame, shown as "affichage"). The NV12 shader of PLAN.md chapter 4 is not written yet.
+- The picture is still converted to RGBA on the CPU for an egui texture (2 ms per frame, shown as "affichage"). The NV12 shader of PLAN.md chapter 4 is not written yet. That conversion must stay on one thread: swscale's YUV to RGB writes past the end of each row, which leaves wrong pixels when rows are written in parallel (`whole_picture_is_right_at_awkward_widths`).
+- An encoder is only chosen when it opens: if it fails on a later frame the capture stops, there is no retry with the next one. And a frame an encoder holds back (`Ok(None)`) only comes out with the next frame. Neither happens with VAAPI or libx264; check both with the phase 3 encoders (NVENC, AMF, QSV).
+- `h264_vaapi` refuses pictures under 128 pixels a side on the RX 5500 XT: libx264 takes over for small windows.
+- On Windows CI, libopenh264 warns that it cannot hold the bitrate without frame skipping. To look at in phase 3.
+- FFmpeg's own messages go straight to stderr, not through `tracing`: route them when file logging lands (phase 3).
 - Diagnostic variables: `MIROIR_ENCODER=<name>` forces an encoder, `MIROIR_PW_NODE=<id>` runs the whole loop on a PipeWire node without the portal (see `docs/test-manuel.md`). The 4K path could not be checked at 60 fps: the test pattern only reaches 26 fps at that size.

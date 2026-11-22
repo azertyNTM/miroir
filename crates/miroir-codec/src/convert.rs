@@ -20,21 +20,32 @@ use ffmpeg_next as ffmpeg;
 /// 0.95 ms with 4, 0.8 ms with 6. The total work is the same, it is only done sooner.
 const BANDS: usize = 6;
 
-/// A swscale context that uses several threads, which ffmpeg-next's own wrapper cannot ask for.
+/// A swscale context that can use several threads, which ffmpeg-next's own wrapper cannot ask
+/// for.
 pub(crate) struct Scaler {
     context: *mut ffi::SwsContext,
     from: (Pixel, u32, u32),
+    to: (Pixel, u32, u32),
 }
 
 impl Scaler {
     /// `from` and `to`: pixel format, width, height.
-    pub(crate) fn new(from: (Pixel, u32, u32), to: (Pixel, u32, u32)) -> anyhow::Result<Self> {
+    ///
+    /// `threaded` must stay false when converting to RGB: swscale then writes whole blocks of
+    /// pixels, past the end of a row and into the start of the next one. On one thread the
+    /// next row is written afterwards and repairs it; with threads it may already be done,
+    /// and a few wrong pixels stay at the left of the picture.
+    pub(crate) fn new(
+        from: (Pixel, u32, u32),
+        to: (Pixel, u32, u32),
+        threaded: bool,
+    ) -> anyhow::Result<Self> {
         // SAFETY: the context is checked, then owned by `scaler`, which frees it. The options
         // are set by name because the struct's fields are only public in recent FFmpeg.
         unsafe {
             let context = ffi::sws_alloc_context();
             ensure!(!context.is_null(), "out of memory");
-            let scaler = Self { context, from };
+            let scaler = Self { context, from, to };
             let format = |pixel: Pixel| ffi::AVPixelFormat::from(pixel) as i64;
             // Bilinear: fast, and good enough when a 1440p or 4K source is reduced.
             let options: [(&CStr, i64); 8] = [
@@ -45,7 +56,7 @@ impl Scaler {
                 (c"dsth", to.2.into()),
                 (c"dst_format", format(to.0)),
                 (c"sws_flags", scaling::Flags::BILINEAR.bits().into()),
-                (c"threads", BANDS as i64),
+                (c"threads", if threaded { BANDS as i64 } else { 1 }),
             ];
             for (name, value) in options {
                 check(ffi::av_opt_set_int(context.cast(), name.as_ptr(), value, 0))?;
@@ -70,12 +81,14 @@ impl Scaler {
         from: &ffmpeg::frame::Video,
         to: &mut ffmpeg::frame::Video,
     ) -> anyhow::Result<()> {
+        let shape = |frame: &ffmpeg::frame::Video| (frame.format(), frame.width(), frame.height());
+        // swscale does not check the destination: too small, it would write outside of it.
         ensure!(
-            (from.format(), from.width(), from.height()) == self.from,
+            shape(from) == self.from && shape(to) == self.to,
             "unexpected picture"
         );
-        // SAFETY: a valid, initialised context, and two valid frames of the sizes it was
-        // initialised for (the destination's is checked by swscale).
+        // SAFETY: a valid, initialised context, and two valid frames of the formats and sizes
+        // it was initialised for, checked just above.
         check(unsafe { ffi::sws_scale_frame(self.context, to.as_mut_ptr(), from.as_ptr()) })?;
         Ok(())
     }
@@ -169,6 +182,21 @@ mod tests {
             (&mut uv, width),
         );
         (y, uv)
+    }
+
+    #[test]
+    fn scaler_refuses_frames_it_was_not_made_for() {
+        let frame = |side| ffmpeg::frame::Video::new(Pixel::NV12, side, side);
+        let mut scaler = Scaler::new((Pixel::NV12, 64, 64), (Pixel::NV12, 32, 32), true).unwrap();
+        assert!(scaler.run(&frame(64), &mut frame(32)).is_ok());
+        assert!(
+            scaler.run(&frame(64), &mut frame(16)).is_err(),
+            "destination too small"
+        );
+        assert!(
+            scaler.run(&frame(32), &mut frame(32)).is_err(),
+            "other source"
+        );
     }
 
     #[test]

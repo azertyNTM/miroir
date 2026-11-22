@@ -10,6 +10,7 @@ use miroir_core::config::Config;
 use tracing::{debug, info, warn};
 
 use preview::{Event, Preview};
+use stats::Summary;
 
 fn main() -> anyhow::Result<()> {
     miroir_core::logging::init_logging();
@@ -168,19 +169,30 @@ fn status_line(preview: &Preview, [width, height]: [usize; 2]) -> String {
         // A screen where nothing moves sends no frames: 0 fps is expected then.
         return line + " — image fixe";
     }
-    line + &format!(
-        " — encodage {} + décodage {} = {} ms (pire image : {} ms) — affichage {} ms",
-        ms(summary.encode),
-        ms(summary.decode),
-        ms(summary.encode + summary.decode),
-        ms(summary.worst),
-        ms(summary.display),
+    line + " — " + &timings(&summary)
+}
+
+fn timings(summary: &Summary) -> String {
+    // The total is made from the two numbers as shown, so the line always adds up.
+    let (encode, decode) = (tenths(summary.encode), tenths(summary.decode));
+    format!(
+        "encodage {} + décodage {} = {} ms (pire image : {} ms) — affichage {} ms",
+        ms(encode),
+        ms(decode),
+        ms(encode + decode),
+        ms(tenths(summary.worst)),
+        ms(tenths(summary.display)),
     )
 }
 
-/// Milliseconds with one decimal, written the French way: `9,1`.
-fn ms(duration: Duration) -> String {
-    format!("{:.1}", duration.as_secs_f64() * 1000.0).replace('.', ",")
+/// Tenths of a millisecond, rounded to the nearest.
+fn tenths(duration: Duration) -> u128 {
+    (duration.as_micros() + 50) / 100
+}
+
+/// Tenths of a millisecond written the French way: 91 gives `9,1`.
+fn ms(tenths: u128) -> String {
+    format!("{},{}", tenths / 10, tenths % 10)
 }
 
 #[cfg(test)]
@@ -189,8 +201,26 @@ mod tests {
 
     #[test]
     fn milliseconds_use_a_decimal_comma() {
-        assert_eq!(ms(Duration::from_micros(9_149)), "9,1");
-        assert_eq!(ms(Duration::ZERO), "0,0");
-        assert_eq!(ms(Duration::from_millis(12)), "12,0");
+        assert_eq!(ms(tenths(Duration::from_micros(9_149))), "9,1");
+        assert_eq!(ms(tenths(Duration::from_micros(9_150))), "9,2");
+        assert_eq!(ms(tenths(Duration::ZERO)), "0,0");
+        assert_eq!(ms(tenths(Duration::from_millis(12))), "12,0");
+    }
+
+    #[test]
+    fn the_total_is_the_sum_of_the_two_numbers_shown() {
+        let us = Duration::from_micros;
+        // 7.04 + 1.54 = 8.58, which alone would round to 8,6.
+        let summary = Summary {
+            fps: 60,
+            encode: us(7_040),
+            decode: us(1_540),
+            display: us(2_000),
+            worst: us(10_260),
+        };
+        assert_eq!(
+            timings(&summary),
+            "encodage 7,0 + décodage 1,5 = 8,5 ms (pire image : 10,3 ms) — affichage 2,0 ms"
+        );
     }
 }

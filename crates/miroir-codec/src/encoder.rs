@@ -184,7 +184,7 @@ impl Encoder {
             None
         } else {
             Some((
-                Scaler::new(from, to)?,
+                Scaler::new(from, to, true)?,
                 ffmpeg::frame::Video::new(from.0, from.1, from.2),
             ))
         };
