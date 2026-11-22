@@ -31,6 +31,9 @@ Read `PLAN.md` first: it is the spec (architecture, technical choices, phases, v
 
 ## Measurements behind phase 2 (Ryzen 5 2600X, RX 5500 XT, 1080p, 10 Mbit/s)
 
+- **Maximum size is 2560x1440, not the 1920x1080 of PLAN.md chapter 6**: Alexis asked for it on 2026-11-22 (`encoded_size`). In 1440p encoding takes 10 to 11.5 ms and decoding 1.5 to 6 ms, so the spec's "encode + decode under 10 ms" cannot be met at that size; 60 fps holds because each side has its own thread (`pipeline` in `preview.rs`), as it will have its own PC. The bitrate is still 10 Mbit/s whatever the size.
+- No test source reaches 60 fps in 1440p with a heavy picture or in 4K (the GStreamer patterns top out at 36 and 26 fps): those cases follow the source, 60 fps there is arithmetic, not a measurement.
+
 - `h264_vaapi` takes 4.5 ms per frame in the GPU, whatever the options (the default preset is already the fastest; CAVLC instead of CABAC only saves 0.3 ms of decoding). With the colour conversion (1 ms) and the upload (1.2 ms), encoding is about 7 ms. Decoding is 1 to 3.5 ms depending on the picture. Encoding plus decoding is therefore 8 to 10.5 ms: the spec's 10 ms target is at the limit of this hardware, and is not met on every frame. Measure before adding anything per frame.
 - Decoding is software on purpose: the GPU decodes in 1.5 ms but reading the picture back to CPU memory costs 3 ms more. Hardware decoding only pays once the picture stays on the GPU (phase 9). Phase 3 asks for D3D11VA: measure the read-back there before choosing.
 - The encoder cuts each picture into 8 slices so the decoder can use 8 threads (`SLICES`): 4.5 ms with one slice, 2.5 ms with 8.

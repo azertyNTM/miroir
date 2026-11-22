@@ -28,6 +28,8 @@ MIROIR_LOG=debug cargo run --release -p miroir-app
 
 Même PC, même commande. L'image affichée n'est plus la capture brute : chaque image est compressée en H.264 puis décompressée avant d'être montrée, comme elle le sera chez l'autre personne.
 
+L'image est encodée à sa taille d'origine jusqu'à 2560×1440 ; au-delà (4K), elle est réduite pour tenir dans 2560×1440.
+
 ```bash
 cargo run --release -p miroir-app
 ```
@@ -44,9 +46,11 @@ Sous les boutons, une ligne d'état résume la dernière seconde :
 - **affichage** : conversion de l'image décodée pour l'écran. Elle ne fait pas partie du décodage et disparaîtra en phase 9.
 
 1. **Encodeur matériel.** Choisir un écran. La ligne d'état doit indiquer `h264_vaapi (matériel)`.
-2. **Fluidité et temps.** Lancer un jeu ou une vidéo 60 fps sur l'écran capturé : environ 60 fps, et le total encodage + décodage sous 10 ms (critère de la spec). Ce critère est à la limite de ce que peut la carte : sur des images de synthèse, je mesure un total de 8 à 10,5 ms selon l'image, dont 4,5 ms passés dans la carte elle-même. Noter le total et la « pire image » observés sur un vrai jeu. Sur un écran immobile, la ligne se termine par « image fixe ».
+2. **Fluidité et temps.** Lancer un jeu ou une vidéo 60 fps sur l'écran capturé : environ 60 fps. Noter le total encodage + décodage et la « pire image » observés sur un vrai jeu. Sur un écran immobile, la ligne se termine par « image fixe ». Ce que je mesure sur des images de synthèse :
+   - écran 1080p : total de 8 à 11 ms, dont 4,5 ms passés dans la carte elle-même. Le critère de la spec (sous 10 ms) est à la limite de ce que peut la carte.
+   - écran 1440p : encodage 10 à 11,5 ms, décodage 1,5 à 6 ms, soit un total de 12 à 17 ms. Le critère des 10 ms ne peut pas être tenu à cette taille ; les 60 fps tiennent parce que l'encodage et le décodage tournent chacun de leur côté, comme sur deux PC.
 3. **Qualité.** L'image doit être nette, le texte lisible, les couleurs justes (pas de rouge et de bleu inversés, pas de voile gris ou vert), sans bandes ni décalage entre le haut et le bas de l'image.
-4. **Écran plus grand que 1080p.** Si l'écran capturé est en 1440p ou en 4K, la ligne d'état affiche une taille réduite (1920×1080 pour un écran 16:9) et l'image reste entière, non rognée.
+4. **Taille de l'image.** La ligne d'état affiche la taille de l'écran capturé (2560×1440 pour un écran 1440p). Pour un écran 4K, elle affiche 2560×1440 et l'image reste entière, non rognée.
 5. **Fenêtre redimensionnée.** « Choisir une autre source… », prendre une fenêtre, la redimensionner plusieurs fois : l'image suit, sans plantage ni message d'erreur.
 6. **Repli logiciel.** Fermer Miroir et le relancer en forçant l'encodeur logiciel. La ligne d'état doit indiquer `libx264 (logiciel)` et l'image doit rester correcte :
 
@@ -57,7 +61,7 @@ Sous les boutons, une ligne d'état résume la dernière seconde :
 7. **Durée.** Laisser tourner deux minutes sur une vidéo : les fps et les temps restent stables.
 8. **Fermeture.** Fermer la fenêtre de Miroir pendant une capture : le programme se termine sans plantage ni message d'erreur dans le terminal.
 
-Mesure des temps sans l'interface, sur une image de synthèse en mouvement envoyée à 60 images par seconde. Elle affiche les temps et le nombre d'images au-dessus de 10 ms, et n'échoue que si 60 fps ne peuvent pas être tenus :
+Mesure des temps sans l'interface, sur une image de synthèse en mouvement envoyée à 60 images par seconde. En 1080p puis en 1440p, elle affiche les temps et le nombre d'images au-dessus de 10 ms, et n'échoue que si 60 fps ne peuvent pas être tenus :
 
 ```bash
 cargo test --release -p miroir-codec -- --ignored --nocapture

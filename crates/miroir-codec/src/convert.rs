@@ -47,7 +47,7 @@ impl Scaler {
             ensure!(!context.is_null(), "out of memory");
             let scaler = Self { context, from, to };
             let format = |pixel: Pixel| ffi::AVPixelFormat::from(pixel) as i64;
-            // Bilinear: fast, and good enough when a 1440p or 4K source is reduced.
+            // Bilinear: fast, and good enough when a 4K source is reduced to 1440p.
             let options: [(&CStr, i64); 8] = [
                 (c"srcw", from.1.into()),
                 (c"srch", from.2.into()),

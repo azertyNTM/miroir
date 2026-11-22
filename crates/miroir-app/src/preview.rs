@@ -1,15 +1,18 @@
-//! Local loop: a worker thread captures, encodes, decodes, and hands the UI the latest picture.
+//! Local loop: one thread captures and encodes, as the sharing PC will; another decodes and
+//! hands the UI the latest picture, as the viewing PC will.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use eframe::egui;
 use miroir_capture::{SelectionCancelled, VideoSource};
-use miroir_codec::{Decoder, Encoder};
+use miroir_codec::{Decoder, EncodedFrame, Encoder};
 use tracing::{debug, info, warn};
 
 use crate::stats::{Stats, Summary, Timing};
@@ -124,47 +127,107 @@ fn run(
     shared.open.store(true, Relaxed);
     // Also lets the UI save the restore token even if the source sends no frame yet.
     ctx.request_repaint();
+    let result = pipeline(&mut *source, ctx, shared);
+    source.stop();
+    result
+}
 
+/// An encoded frame on its way to the display side, with the time it took to encode.
+type Packet = (EncodedFrame, Duration);
+
+/// Encoded frames that may wait for the display side. When it is full the sharing side waits,
+/// and the capture skips frames meanwhile: never an encoded one, which later frames build on.
+const QUEUE: usize = 4;
+
+/// Runs both sides until the capture stops or one of them fails.
+///
+/// Two threads because each side has a whole frame time to itself on its own PC. In 1440p,
+/// encoding takes 11 ms and decoding plus display 9 ms: one after the other they would not fit
+/// in the 16.7 ms of a frame at 60 fps.
+fn pipeline(
+    source: &mut dyn VideoSource,
+    ctx: &egui::Context,
+    shared: &Shared,
+) -> anyhow::Result<()> {
+    let (packets, received) = sync_channel(QUEUE);
+    std::thread::scope(|scope| {
+        let viewer = scope.spawn(move || view(ctx, shared, received));
+        // Returning drops the channel's sending end, which is what ends the other side.
+        let sharing = share(source, shared, packets);
+        let viewing = viewer
+            .join()
+            .unwrap_or_else(|_| Err(anyhow!("the display side panicked")));
+        // If the display side failed, the sharing side only saw a closed channel.
+        viewing.and(sharing)
+    })
+}
+
+/// The sharing side: captures and encodes.
+fn share(
+    source: &mut dyn VideoSource,
+    shared: &Shared,
+    packets: SyncSender<Packet>,
+) -> anyhow::Result<()> {
     // For tests and diagnostics, e.g. MIROIR_ENCODER=libx264 to try the software fallback.
     let forced = std::env::var("MIROIR_ENCODER").ok();
     let mut encoder: Option<Encoder> = None;
+    while !shared.stop.load(Relaxed) {
+        let Some(frame) = source.next_frame()? else {
+            continue;
+        };
+        // ponytail: a new encoder for every new size, so one per frame while a captured
+        // window is being resized. Wait for the size to settle if that ever stutters.
+        let size = (frame.width, frame.height);
+        let encoder = match &mut encoder {
+            Some(encoder) if encoder.source_size() == size => encoder,
+            slot => {
+                let new = Encoder::new(size.0, size.1, forced.as_deref())?;
+                *shared.encoder.lock().unwrap() = Some((new.name(), new.is_hardware()));
+                slot.insert(new)
+            }
+        };
+        let start = Instant::now();
+        let Some(encoded) = encoder.encode(&frame)? else {
+            continue;
+        };
+        if packets.send((encoded, start.elapsed())).is_err() {
+            // The display side is gone, and reports why itself.
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The display side: decodes, and hands the UI the latest picture and the timings.
+fn view(ctx: &egui::Context, shared: &Shared, packets: Receiver<Packet>) -> anyhow::Result<()> {
     let mut decoder = Decoder::new()?;
     let mut stats = Stats::default();
     let mut logged = Instant::now();
-    while !shared.stop.load(Relaxed) {
-        if let Some(frame) = source.next_frame()? {
-            // ponytail: a new encoder for every new size, so one per frame while a captured
-            // window is being resized. Wait for the size to settle if that ever stutters.
-            let size = (frame.width, frame.height);
-            let encoder = match &mut encoder {
-                Some(encoder) if encoder.source_size() == size => encoder,
-                slot => {
-                    let new = Encoder::new(size.0, size.1, forced.as_deref())?;
-                    *shared.encoder.lock().unwrap() = Some((new.name(), new.is_hardware()));
-                    slot.insert(new)
+    loop {
+        // Not forever: the frame rate shown must fall when frames stop coming.
+        match packets.recv_timeout(Duration::from_millis(100)) {
+            Ok((packet, encode)) => {
+                let start = Instant::now();
+                if let Some(decoded) = decoder.decode(&packet)? {
+                    let decoded_at = Instant::now();
+                    let rgba = decoder.to_rgba(&decoded)?;
+                    let size = [rgba.width as usize, rgba.height as usize];
+                    *shared.image.lock().unwrap() = Some(to_color_image(size, rgba.rows()));
+                    ctx.request_repaint();
+                    let now = Instant::now();
+                    let (decode, display) = (decoded_at - start, now - decoded_at);
+                    stats.record(
+                        now,
+                        Timing {
+                            encode,
+                            decode,
+                            display,
+                        },
+                    );
                 }
-            };
-
-            let start = Instant::now();
-            let packet = encoder.encode(&frame)?;
-            let encoded = Instant::now();
-            let decoded = match &packet {
-                Some(packet) => decoder.decode(packet)?,
-                None => None,
-            };
-            let decoded_at = Instant::now();
-            if let Some(decoded) = decoded {
-                let rgba = decoder.to_rgba(&decoded)?;
-                let size = [rgba.width as usize, rgba.height as usize];
-                *shared.image.lock().unwrap() = Some(to_color_image(size, rgba.rows()));
-                let now = Instant::now();
-                let timing = Timing {
-                    encode: encoded - start,
-                    decode: decoded_at - encoded,
-                    display: now - decoded_at,
-                };
-                stats.record(now, timing);
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
         let summary = stats.summary(Instant::now());
         if summary.fps > 0 && logged.elapsed() >= Duration::from_secs(1) {
@@ -175,8 +238,6 @@ fn run(
             ctx.request_repaint();
         }
     }
-    source.stop();
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -255,6 +316,52 @@ mod tests {
         drop(sender);
         assert!(matches!(preview.poll_event(), Some(Event::Ended(None))));
         assert!(preview.poll_event().is_none());
+    }
+
+    /// Gives a few red pictures, then fails like a source that went away.
+    struct FewFrames(u64);
+
+    impl VideoSource for FewFrames {
+        fn next_frame(&mut self) -> anyhow::Result<Option<miroir_core::frame::VideoFrame>> {
+            use miroir_core::frame::{FrameData, VideoFrame};
+            anyhow::ensure!(self.0 > 0, "the source is gone");
+            self.0 -= 1;
+            let data = FrameData::CpuBgra([0, 0, 255, 255].repeat(64 * 48));
+            Ok(Some(VideoFrame {
+                width: 64,
+                height: 48,
+                pts_us: 1000 - self.0,
+                data,
+            }))
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    #[test]
+    fn frames_go_through_both_sides_and_a_failure_is_reported() {
+        let shared = Shared::default();
+        let result = pipeline(&mut FewFrames(3), &egui::Context::default(), &shared);
+
+        assert_eq!(result.unwrap_err().to_string(), "the source is gone");
+        // What was encoded before the failure still reached the display side.
+        let image = shared
+            .image
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no picture was shown");
+        assert_eq!(image.size, [64, 48]);
+        let [r, g, b, _] = image.pixels[0].to_array();
+        assert!(r > 200 && g < 60 && b < 60, "expected red, got {r},{g},{b}");
+        assert!(shared.encoder.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn stopping_ends_both_sides() {
+        let shared = Shared::default();
+        shared.stop.store(true, Relaxed);
+        pipeline(&mut FewFrames(u64::MAX), &egui::Context::default(), &shared).unwrap();
     }
 
     #[test]
